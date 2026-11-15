@@ -129,8 +129,8 @@ PlasmoidItem {
         }
     }
 
-    onExpandedChanged: {
-        if (expanded) {
+    onExpandedChanged: isExpanded => {
+        if (isExpanded) {
             refresh();
         }
     }
