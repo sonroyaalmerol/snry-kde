@@ -1,0 +1,21 @@
+{
+  "KPlugin": {
+    "Name": "Snry Workspaces",
+    "Description": "Hyprland-style per-monitor workspaces on Plasma 6.7+ per-screen virtual desktops. Super+1..5 / Super+6..0 switch monitor 1 / monitor 2 workspaces; add Shift to move the focused window there.",
+    "Icon": "preferences-system-windows",
+    "Authors": [
+      {
+        "Email": "github@snry.me",
+        "Name": "Son Roy Almerol"
+      }
+    ],
+    "Id": "snry-workspaces",
+    "Version": "@VERSION@",
+    "License": "GPL-3.0-or-later",
+    "Website": "https://github.com/sonroyaalmerol/snry-kde"
+  },
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "code/main.js",
+  "KPackageStructure": "KWin/Script",
+  "X-KDE-ConfigModule": "kwin/effects/configs/kcm_kwin4_genericscripted"
+}

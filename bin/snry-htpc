@@ -1,0 +1,522 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+VERSION="@VERSION@"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+CONF_FILE="snry-htpcrc"
+CONF_GROUP="General"
+CONF_KEYS=(
+	TvOutput TvMode TvScale
+	Monitor1Output Monitor1Mode
+	Monitor2Output Monitor2Mode Monitor2Position
+	DesktopSink CouchSink
+	KodiCommand SteamGamescope Notifications
+)
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/snry-htpc"
+LOG="$STATE_DIR/snry-htpc.log"
+LOCK="$RUNTIME_DIR/snry-htpc.lock"
+SESSION="$RUNTIME_DIR/snry-htpc.session"
+STEAM_PIDFILE="$RUNTIME_DIR/snry-htpc-steam.pid"
+SAVED_SINK="$STATE_DIR/desktop-sink"
+STEAM_RE='steam\.sh|steamwebhelper|ubuntu12_32/steam'
+mkdir -p "$STATE_DIR"
+
+log() { printf '%s [%s] %s\n' "$(date '+%F %T')" "$$" "$*" >>"$LOG"; }
+
+conf() {
+	local v
+	v="$(kreadconfig6 --file "$CONF_FILE" --group "$CONF_GROUP" --key "$1" 2>/dev/null)" || v=""
+	printf '%s' "${v:-${2:-}}"
+}
+
+conf_bool() {
+	case "$(conf "$1" "$2")" in
+		true | 1 | yes | on) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+notify() {
+	conf_bool Notifications true || return 0
+	notify-send -a "HTPC" -i "$1" "HTPC" "$2" >/dev/null 2>&1 || true
+}
+
+fail() {
+	log "ERROR: $*"
+	notify dialog-error "$*"
+	echo "snry-htpc: $*" >&2
+	exit 1
+}
+
+json=""
+refresh() { json="$(kscreen-doctor -j 2>>"$LOG")" || json=""; }
+
+jqo() { jq -r "$@" <<<"$json" 2>/dev/null; }
+
+output_state() {
+	local s
+	s="$(jqo --arg n "$1" 'first(.outputs[] | select(.name == $n)
+		| if (.connected | not) then "disconnected"
+		  elif .enabled then "enabled" else "disabled" end) // "missing"')"
+	printf '%s' "${s:-missing}"
+}
+
+is_connected() {
+	[[ -n "$1" ]] || return 1
+	local s
+	s="$(output_state "$1")"
+	[[ "$s" == "enabled" || "$s" == "disabled" ]]
+}
+
+tv_output() {
+	local v
+	v="$(conf TvOutput)"
+	[[ -n "$v" ]] || v="$(jqo 'first(.outputs[] | select(.connected and (.name | test("^HDMI"))) | .name) // empty')"
+	printf '%s' "$v"
+}
+
+monitor_outputs() {
+	local tv="$1" m1 m2
+	m1="$(conf Monitor1Output)"
+	m2="$(conf Monitor2Output)"
+	if [[ -z "$m1" || -z "$m2" ]]; then
+		local auto=()
+		mapfile -t auto < <(jqo --arg tv "$tv" --arg m1 "$m1" --arg m2 "$m2" '
+			[.outputs[] | select(.connected and .name != $tv and .name != $m1 and .name != $m2)]
+			| sort_by(.pos.x, .name) | .[].name')
+		if [[ -z "$m1" ]]; then
+			m1="${auto[0]:-}"
+			auto=("${auto[@]:1}")
+		fi
+		[[ -n "$m2" ]] || m2="${auto[0]:-}"
+	fi
+	printf '%s\n%s\n' "$m1" "$m2"
+}
+
+logical_width() {
+	local name="$1" mode="$2"
+	jqo --arg n "$name" --arg m "$mode" '
+		first(.outputs[] | select(.name == $n)) as $o
+		| (if $m != "" then (first($o.modes[] | select(.name == $m)) | .size.width)
+		   else (first($o.modes[] | select(.id == $o.currentModeId)) | .size.width) // $o.size.width end) as $w
+		| (($w // 0) / ($o.scale // 1)) | floor'
+}
+
+current_mode() {
+	refresh
+	[[ -n "$json" ]] || { echo "unknown"; return; }
+	local tv m1 m2
+	tv="$(tv_output)"
+	{ read -r m1; read -r m2; } < <(monitor_outputs "$tv")
+	local stv sm1 sm2
+	stv="$(output_state "$tv")"
+	sm1="$(output_state "$m1")"
+	sm2="$(output_state "$m2")"
+	if [[ "$stv" == "enabled" && "$sm1" != "enabled" && "$sm2" != "enabled" ]]; then
+		echo "couch"
+	elif [[ "$stv" != "enabled" ]]; then
+		echo "desktop"
+	else
+		echo "mixed"
+	fi
+}
+
+wait_for_mode() {
+	for _ in $(seq 1 25); do
+		[[ "$(current_mode)" == "$1" ]] && return 0
+		sleep 0.2
+	done
+	return 1
+}
+
+kscreen() {
+	log "kscreen-doctor $*"
+	kscreen-doctor "$@" >>"$LOG" 2>&1
+}
+
+sinks_json() { pactl -f json list sinks 2>/dev/null || echo '[]'; }
+
+sink_exists() { [[ -n "$1" ]] && pactl list short sinks 2>/dev/null | cut -f2 | grep -qxF "$1"; }
+
+find_couch_sink() {
+	local v
+	v="$(conf CouchSink)"
+	if [[ -n "$v" ]]; then
+		sink_exists "$v" && printf '%s' "$v"
+		return
+	fi
+	sinks_json | jq -r 'first(.[] | select(.name | test("hdmi"; "i")) | .name) // empty' 2>/dev/null
+}
+
+wake_hdmi_cards() {
+	local want="${1:-}"
+	pactl -f json list cards 2>/dev/null | jq -r --arg want "$want" '
+		.[] | (.name | sub("^alsa_card\\."; "")) as $c
+		| select($want == "" or ($want | contains($c)))
+		| .name as $card
+		| first(.profiles | to_entries[]
+			| select(.key | test("^output:hdmi-stereo")) | select(.value.available != false) | .key) as $p
+		| select(.active_profile | test("hdmi") | not)
+		| select(.active_profile != $p) | "\($card)\t\($p)"' 2>/dev/null |
+		while IFS=$'\t' read -r card profile; do
+			log "setting $card profile $profile"
+			pactl set-card-profile "$card" "$profile" >>"$LOG" 2>&1 || true
+		done
+}
+
+move_streams() {
+	local input
+	while read -r input _; do
+		[[ -n "$input" ]] && pactl move-sink-input "$input" "$1" >/dev/null 2>&1 || true
+	done < <(pactl list short sink-inputs 2>/dev/null)
+}
+
+use_sink() {
+	pactl set-default-sink "$1" >>"$LOG" 2>&1 || return 1
+	move_streams "$1"
+	log "default sink -> $1"
+}
+
+audio_couch() {
+	local sink="" i
+	for i in $(seq 1 40); do
+		sink="$(find_couch_sink)"
+		[[ -n "$sink" ]] && break
+		[[ "$i" == 10 ]] && wake_hdmi_cards "$(conf CouchSink)"
+		sleep 0.25
+	done
+	[[ -n "$sink" ]] || return 1
+	use_sink "$sink"
+}
+
+audio_desktop() {
+	local sink
+	sink="$(conf DesktopSink)"
+	[[ -n "$sink" ]] || sink="$(cat "$SAVED_SINK" 2>/dev/null)"
+	[[ -n "$sink" ]] || return 0
+	for _ in $(seq 1 20); do
+		sink_exists "$sink" && break
+		sleep 0.25
+	done
+	sink_exists "$sink" || return 1
+	use_sink "$sink"
+}
+
+remember_desktop_sink() {
+	local cur
+	cur="$(pactl get-default-sink 2>/dev/null)"
+	[[ -n "$cur" && ! "$cur" =~ [Hh][Dd][Mm][Ii] ]] && printf '%s\n' "$cur" >"$SAVED_SINK"
+}
+
+mode_desktop() {
+	stop_apps
+
+	refresh
+	[[ -n "$json" ]] || fail "Cannot query displays (kscreen-doctor failed)"
+	local tv m1 m2
+	tv="$(tv_output)"
+	{ read -r m1; read -r m2; } < <(monitor_outputs "$tv")
+
+	local args=() m1mode m2mode pos
+	m1mode="$(conf Monitor1Mode)"
+	m2mode="$(conf Monitor2Mode)"
+	if is_connected "$m1"; then
+		args+=("output.${m1}.enable")
+		[[ -n "$m1mode" ]] && args+=("output.${m1}.mode.${m1mode}")
+		args+=("output.${m1}.position.0,0")
+	fi
+	if is_connected "$m2"; then
+		pos="$(conf Monitor2Position)"
+		if [[ -z "$pos" ]]; then
+			if is_connected "$m1"; then
+				pos="$(logical_width "$m1" "$m1mode"),0"
+			else
+				pos="0,0"
+			fi
+		fi
+		args+=("output.${m2}.enable")
+		[[ -n "$m2mode" ]] && args+=("output.${m2}.mode.${m2mode}")
+		args+=("output.${m2}.position.${pos}")
+	fi
+	((${#args[@]})) || fail "No desktop monitors detected — staying on the TV"
+
+	if [[ "$(current_mode)" != "desktop" ]]; then
+		local off=()
+		is_connected "$tv" && off=("output.${tv}.disable")
+		if ! kscreen "${args[@]}" "${off[@]}"; then
+			log "atomic switch failed; retrying in two steps"
+			kscreen "${args[@]}" || fail "Could not enable the desktop monitors"
+			((${#off[@]})) && { kscreen "${off[@]}" || log "could not disable $tv"; }
+		fi
+		wait_for_mode desktop || fail "Displays did not switch to desktop mode"
+	fi
+
+	audio_desktop || notify audio-card "Desktop mode is on, but the desktop audio output was not found"
+	notify video-display "Desktop mode"
+	log "desktop mode active"
+	echo "desktop"
+}
+
+mode_couch() {
+	refresh
+	[[ -n "$json" ]] || fail "Cannot query displays (kscreen-doctor failed)"
+	local tv m1 m2
+	tv="$(tv_output)"
+	[[ -n "$tv" ]] || fail "No TV output configured or detected"
+	is_connected "$tv" || fail "TV ($tv) not detected — is it on and on the right input?"
+	{ read -r m1; read -r m2; } < <(monitor_outputs "$tv")
+
+	local cur
+	cur="$(current_mode)"
+	[[ "$cur" == "desktop" ]] && remember_desktop_sink
+
+	if [[ "$cur" != "couch" ]]; then
+		local on=("output.${tv}.enable") off=() tvmode tvscale
+		tvmode="$(conf TvMode)"
+		tvscale="$(conf TvScale)"
+		[[ -n "$tvmode" ]] && on+=("output.${tv}.mode.${tvmode}")
+		on+=("output.${tv}.position.0,0")
+		[[ -n "$tvscale" ]] && on+=("output.${tv}.scale.${tvscale}")
+		is_connected "$m1" && off+=("output.${m1}.disable")
+		is_connected "$m2" && off+=("output.${m2}.disable")
+		if ! kscreen "${on[@]}" "${off[@]}"; then
+			log "atomic switch failed; retrying in two steps"
+			kscreen "${on[@]}" || fail "Could not enable the TV"
+			((${#off[@]})) && { kscreen "${off[@]}" || log "could not disable desktop monitors"; }
+		fi
+		wait_for_mode couch || fail "Displays did not switch to couch mode"
+	fi
+
+	audio_couch || notify audio-card "Couch mode is on, but no HDMI audio output appeared"
+	notify video-television "Couch mode"
+	log "couch mode active"
+	echo "couch"
+}
+
+with_lock() {
+	exec 9>"$LOCK"
+	flock -w 60 9 || fail "Another mode switch is still running"
+}
+
+steam_running() { pgrep -f "$STEAM_RE" >/dev/null 2>&1; }
+
+wait_steam_gone() {
+	for _ in $(seq 1 "$1"); do
+		steam_running || return 0
+		sleep 0.5
+	done
+	return 1
+}
+
+shutdown_steam() {
+	steam_running || return 0
+	steam -shutdown >/dev/null 2>&1 9>&- &
+	if ! wait_steam_gone 30; then
+		pkill -f "$STEAM_RE" 2>/dev/null || true
+		wait_steam_gone 6 || pkill -9 -f "$STEAM_RE" 2>/dev/null || true
+	fi
+}
+
+stop_apps() {
+	rm -f "$SESSION"
+	if [[ -f "$STEAM_PIDFILE" ]]; then
+		log "stopping couch Steam"
+		shutdown_steam
+		rm -f "$STEAM_PIDFILE"
+	fi
+	if pgrep -x kodi.bin >/dev/null 2>&1 || pgrep -x kodi >/dev/null 2>&1; then
+		log "stopping Kodi"
+		pkill -x kodi.bin 2>/dev/null || true
+		pkill -x kodi 2>/dev/null || true
+		for _ in $(seq 1 20); do
+			pgrep -x kodi.bin >/dev/null 2>&1 || break
+			sleep 0.5
+		done
+		pkill -9 -x kodi.bin 2>/dev/null || true
+	fi
+}
+
+run_steam() {
+	local was_running=0 launcher=()
+	if steam_running; then
+		was_running=1
+		shutdown_steam
+		sleep 1
+	fi
+	if conf_bool SteamGamescope false; then
+		if command -v scopebuddy >/dev/null; then
+			launcher=(scopebuddy -f --)
+		elif command -v gamescope >/dev/null; then
+			launcher=(gamescope -f --)
+		fi
+	fi
+	"${launcher[@]}" steam -tenfoot 9>&- &
+	local pid=$!
+	echo "$pid" >"$STEAM_PIDFILE"
+	wait "$pid" || true
+	wait_steam_gone 20 || true
+	rm -f "$STEAM_PIDFILE"
+	if ((was_running)) && ! steam_running; then
+		setsid -f steam -silent >/dev/null 2>&1 </dev/null
+	fi
+}
+
+run_kodi() {
+	local cmd
+	cmd="$(conf KodiCommand kodi)"
+	bash -c "$cmd" 9>&-
+}
+
+session() {
+	local app="$1"
+	echo "$$" >"$SESSION"
+	log "session $app start"
+	if ! "$SELF" mode couch >/dev/null; then
+		log "couch mode failed; not launching $app"
+		[[ "$(cat "$SESSION" 2>/dev/null)" == "$$" ]] && rm -f "$SESSION"
+		exit 1
+	fi
+	case "$app" in
+		kodi) run_kodi ;;
+		steam) run_steam ;;
+	esac
+	log "session $app ended"
+	if [[ "$(cat "$SESSION" 2>/dev/null)" == "$$" ]]; then
+		rm -f "$SESSION"
+		"$SELF" mode desktop >/dev/null
+	fi
+}
+
+launch() {
+	local app="$1"
+	case "$app" in
+		kodi) command -v "$(conf KodiCommand kodi | awk '{print $1}')" >/dev/null || fail "Kodi is not installed" ;;
+		steam) command -v steam >/dev/null || fail "Steam is not installed" ;;
+		*) usage ;;
+	esac
+	if [[ -f "$SESSION" ]]; then
+		local old
+		old="$(cat "$SESSION" 2>/dev/null)"
+		echo "$$" >"$SESSION"
+		[[ -n "$old" ]] && log "replacing session $old"
+		stop_running_apps_only
+	fi
+	setsid -f "$SELF" __session "$app" >>"$LOG" 2>&1 </dev/null
+	notify video-television "Launching $app on the TV…"
+}
+
+stop_running_apps_only() {
+	local keep
+	keep="$(cat "$SESSION" 2>/dev/null)"
+	stop_apps
+	[[ -n "$keep" ]] && echo "$keep" >"$SESSION"
+}
+
+list_json() {
+	refresh
+	local mode cfg
+	mode="$(current_mode)"
+	cfg="$(config_json)"
+	jq -n --arg mode "$mode" --arg version "$VERSION" \
+		--argjson cfg "$cfg" \
+		--argjson screens "${json:-"{}"}" \
+		--argjson sinks "$(sinks_json)" '
+		{
+			version: $version,
+			mode: $mode,
+			config: $cfg,
+			outputs: [($screens.outputs // [])[] | {
+				name, connected, enabled,
+				modes: ([.modes[] | {name, w: .size.width, h: .size.height, r: .refreshRate}]
+					| unique_by(.name) | sort_by(-.w, -.h, -.r) | map(.name))
+			}],
+			sinks: [$sinks[] | {name, description}]
+		}'
+}
+
+config_json() {
+	local k args=()
+	for k in "${CONF_KEYS[@]}"; do
+		args+=(--arg "$k" "$(conf "$k")")
+	done
+	jq -n "${args[@]}" '$ARGS.named'
+}
+
+config_set() {
+	local key="$1" value="${2:-}" k ok=0
+	for k in "${CONF_KEYS[@]}"; do [[ "$k" == "$key" ]] && ok=1; done
+	((ok)) || fail "Unknown config key: $key (valid: ${CONF_KEYS[*]})"
+	if [[ -z "$value" ]]; then
+		kwriteconfig6 --file "$CONF_FILE" --group "$CONF_GROUP" --key "$key" --delete
+	else
+		kwriteconfig6 --file "$CONF_FILE" --group "$CONF_GROUP" --key "$key" "$value"
+	fi
+}
+
+config_cmd() {
+	case "${1:-dump}" in
+		get) conf "${2:?key}"; echo ;;
+		set) config_set "${2:?key}" "${3:-}" ;;
+		unset) config_set "${2:?key}" "" ;;
+		set-json)
+			local key value
+			while IFS=$'\t' read -r key value; do
+				config_set "$key" "$value"
+			done < <(jq -r 'to_entries[] | "\(.key)\t\(.value | tostring)"' <<<"${2:?json}")
+			;;
+		json) config_json ;;
+		dump) config_json | jq -r 'to_entries[] | "\(.key)=\(.value)"' ;;
+		path) echo "${XDG_CONFIG_HOME:-$HOME/.config}/$CONF_FILE" ;;
+		*) usage ;;
+	esac
+}
+
+usage() {
+	cat >&2 <<EOF
+snry-htpc $VERSION — switch between desktop monitors and a TV
+
+Usage:
+  snry-htpc mode [desktop|couch|toggle|status]
+  snry-htpc launch [kodi|steam]     switch to the TV and start an app; back to desktop when it exits
+  snry-htpc stop                    stop TV apps started by snry-htpc
+  snry-htpc list                    JSON with outputs, sinks, mode and config
+  snry-htpc config [dump|json|get KEY|set KEY VALUE|unset KEY|set-json JSON|path]
+  snry-htpc log                     follow the log
+
+Config keys (empty = auto-detect): ${CONF_KEYS[*]}
+EOF
+	exit 1
+}
+
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+	mode)
+		sub="${1:-toggle}"
+		case "$sub" in
+			status) current_mode ;;
+			desktop | couch | toggle)
+				with_lock
+				log "request: mode $sub"
+				if [[ "$sub" == "toggle" ]]; then
+					[[ "$(current_mode)" == "desktop" ]] && sub="couch" || sub="desktop"
+				fi
+				if [[ "$sub" == "couch" ]]; then mode_couch; else mode_desktop; fi
+				;;
+			*) usage ;;
+		esac
+		;;
+	desktop | couch | toggle | status) exec "$SELF" mode "$cmd" ;;
+	launch) launch "${1:-}" ;;
+	stop) stop_apps; echo "stopped" ;;
+	__session) session "${1:?}" ;;
+	list) list_json ;;
+	config) config_cmd "$@" ;;
+	log) exec tail -n 50 -F "$LOG" ;;
+	version | --version | -V) echo "$VERSION" ;;
+	*) usage ;;
+esac

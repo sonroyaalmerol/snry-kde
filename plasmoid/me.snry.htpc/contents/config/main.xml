@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0 http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="General">
+    <entry name="tvOutput" type="String">
+      <default></default>
+    </entry>
+    <entry name="tvMode" type="String">
+      <default></default>
+    </entry>
+    <entry name="tvScale" type="String">
+      <default></default>
+    </entry>
+    <entry name="monitor1Output" type="String">
+      <default></default>
+    </entry>
+    <entry name="monitor1Mode" type="String">
+      <default></default>
+    </entry>
+    <entry name="monitor2Output" type="String">
+      <default></default>
+    </entry>
+    <entry name="monitor2Mode" type="String">
+      <default></default>
+    </entry>
+    <entry name="monitor2Position" type="String">
+      <default></default>
+    </entry>
+    <entry name="desktopSink" type="String">
+      <default></default>
+    </entry>
+    <entry name="couchSink" type="String">
+      <default></default>
+    </entry>
+    <entry name="kodiCommand" type="String">
+      <default></default>
+    </entry>
+    <entry name="steamGamescope" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="notifications" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="showLaunchers" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="imported" type="Bool">
+      <default>false</default>
+    </entry>
+  </group>
+</kcfg>

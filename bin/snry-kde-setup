@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+VERSION="@VERSION@"
+DATADIR="@DATADIR@"
+[[ -d "$DATADIR" ]] || DATADIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../share/snry-kde" 2>/dev/null && pwd)"
+
+KROHNKITE_API="https://codeberg.org/api/v1/repos/anametologin/Krohnkite/releases?limit=1"
+SCRIPT_ID="snry-workspaces"
+OLD_SCRIPT_IDS=(hyprland-workspaces hyprsweep)
+
+do_kwin=1
+do_krohnkite=1
+do_shortcuts=1
+do_rules=1
+update_krohnkite=0
+
+usage() {
+	cat <<EOF
+snry-kde-setup $VERSION — configure the current user's Plasma session for snry-kde
+
+Usage: snry-kde-setup [options]
+  --skip-kwin         don't touch KWin desktop/screen settings
+  --skip-krohnkite    don't install/enable Krohnkite
+  --update-krohnkite  reinstall the latest Krohnkite release even if present
+  --skip-shortcuts    don't apply the shortcut layout
+  --skip-rules        don't add the window rule
+  -h, --help
+EOF
+}
+
+while (($#)); do
+	case "$1" in
+		--skip-kwin) do_kwin=0 ;;
+		--skip-krohnkite) do_krohnkite=0 ;;
+		--update-krohnkite) update_krohnkite=1 ;;
+		--skip-shortcuts) do_shortcuts=0 ;;
+		--skip-rules) do_rules=0 ;;
+		-h | --help) usage; exit 0 ;;
+		*) usage >&2; exit 1 ;;
+	esac
+	shift
+done
+
+say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*" >&2; }
+
+need() {
+	local missing=()
+	for c in "$@"; do command -v "$c" >/dev/null || missing+=("$c"); done
+	if ((${#missing[@]})); then
+		warn "missing commands: ${missing[*]}"
+		exit 1
+	fi
+}
+need kwriteconfig6 kreadconfig6 gdbus kpackagetool6
+
+wrc() { kwriteconfig6 --file "$1" --group "$2" --key "$3" "$4"; }
+rrc() { kreadconfig6 --file "$1" --group "$2" --key "$3" 2>/dev/null; }
+set_default() { [[ -n "$(rrc "$1" "$2" "$3")" ]] || wrc "$@"; }
+
+kwin_session() { gdbus introspect --session --dest org.kde.KWin --object-path /Scripting >/dev/null 2>&1; }
+
+kga() {
+	gdbus call --session --dest org.kde.kglobalaccel --object-path "$1" --method "$2" "${@:3}" 2>/dev/null
+}
+
+gv_str() {
+	local s="${1//\\/\\\\}"
+	printf "'%s'" "${s//\'/\\\'}"
+}
+
+backup() {
+	local dir
+	dir="${XDG_CONFIG_HOME:-$HOME/.config}/.bak/snry-kde-$(date +%Y%m%d-%H%M%S)"
+	mkdir -p "$dir"
+	for f in kwinrc kwinrulesrc kglobalshortcutsrc; do
+		[[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/$f" ]] && cp -a "${XDG_CONFIG_HOME:-$HOME/.config}/$f" "$dir/"
+	done
+	info "backup: $dir"
+}
+
+script_installed() {
+	local id="$1" d
+	for d in "${XDG_DATA_HOME:-$HOME/.local/share}" ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+		for dd in ${d//:/ }; do
+			[[ -f "$dd/kwin/scripts/$id/metadata.json" ]] && return 0
+		done
+	done
+	return 1
+}
+
+unregister_old_shortcuts() {
+	local names n count=0
+	names="$(kga /component/kwin org.kde.kglobalaccel.Component.shortcutNames)" || return 0
+	while read -r n; do
+		[[ -n "$n" ]] || continue
+		case "$n" in
+			hyprland-workspaces_* | HyprSweep*)
+				kga /kglobalaccel org.kde.KGlobalAccel.unregister "kwin" "$n" >/dev/null && count=$((count + 1))
+				;;
+		esac
+	done < <(grep -oE "'[^']+'" <<<"$names" | tr -d "'")
+	((count)) && info "removed $count stale shortcuts from old scripts"
+}
+
+migrate_old() {
+	local id k v
+	for id in "${OLD_SCRIPT_IDS[@]}"; do
+		[[ "$(rrc kwinrc Plugins "${id}Enabled")" == "true" ]] || continue
+		wrc kwinrc Plugins "${id}Enabled" false
+		info "disabled old KWin script: $id"
+	done
+	for k in screen1Name screen2Name moveCursor; do
+		v="$(rrc kwinrc Script-hyprland-workspaces "$k")"
+		[[ -n "$v" ]] && set_default kwinrc "Script-$SCRIPT_ID" "$k" "$v"
+	done
+	unregister_old_shortcuts
+}
+
+setup_kwin() {
+	say "KWin: per-screen virtual desktops"
+	wrc kwinrc Windows PerOutputVirtualDesktops true
+	wrc kwinrc Windows SeparateScreenFocus true
+	wrc kwinrc Windows ActiveMouseScreen false
+	wrc kwinrc Desktops Rows 1
+	wrc kwinrc Plugins tilingEnabled false
+	migrate_old
+	script_installed "$SCRIPT_ID" || warn "$SCRIPT_ID KWin script not found — is snry-kde installed?"
+	wrc kwinrc Plugins "${SCRIPT_ID}Enabled" true
+	info "enabled $SCRIPT_ID"
+}
+
+install_krohnkite() {
+	say "Krohnkite tiling"
+	if script_installed krohnkite && ((!update_krohnkite)); then
+		info "already installed"
+	else
+		need curl jq
+		local url tmp
+		url="$(curl -fsSL "$KROHNKITE_API" | jq -r '[.[0].assets[] | select(.name | endswith(".kwinscript"))] | (map(select(.name != "krohnkite.kwinscript")) + .)[0].browser_download_url // empty')"
+		if [[ -z "$url" ]]; then
+			warn "could not find a Krohnkite release; install it from System Settings > KWin Scripts"
+			return
+		fi
+		tmp="$(mktemp --suffix=.kwinscript)"
+		if curl -fsSL -o "$tmp" "$url"; then
+			kpackagetool6 --type KWin/Script --upgrade "$tmp" >/dev/null 2>&1 ||
+				kpackagetool6 --type KWin/Script --install "$tmp" >/dev/null 2>&1 ||
+				warn "kpackagetool6 failed to install $url"
+			info "installed $(basename "$url")"
+		else
+			warn "download failed: $url"
+		fi
+		rm -f "$tmp"
+	fi
+	wrc kwinrc Plugins krohnkiteEnabled true
+	local g="Script-krohnkite"
+	set_default kwinrc "$g" srfOvercapacityMode 0
+	set_default kwinrc "$g" preventMinimize true
+	set_default kwinrc "$g" movePointerOnFocus true
+	for k in screenGapTop screenGapBottom screenGapLeft screenGapRight screenGapBetween; do
+		set_default kwinrc "$g" "$k" 10
+	done
+}
+
+add_window_rule() {
+	say "Window rule: minimum size 0x0 (lets tiles shrink)"
+	local order g
+	order="$(rrc kwinrulesrc General Order)"
+	for g in ${order//,/ }; do
+		if [[ "$(rrc kwinrulesrc "$g" Description)" == "snry-kde: minimum size 0x0" ||
+			"$(rrc kwinrulesrc "$g" Description)" == "Hyprland: minimum geometry 0x0" ]]; then
+			info "already present ($g)"
+			return
+		fi
+	done
+	g="snry-kde-minsize"
+	wrc kwinrulesrc "$g" Description "snry-kde: minimum size 0x0"
+	wrc kwinrulesrc "$g" types 1
+	wrc kwinrulesrc "$g" minsize "0,0"
+	wrc kwinrulesrc "$g" minsizerule 2
+	wrc kwinrulesrc General Order "${order:+$order,}$g"
+	info "added"
+}
+
+reload_kwin() {
+	say "Reloading KWin configuration and scripts"
+	if ! kwin_session; then
+		info "KWin is not running in this session; changes apply at next login"
+		return
+	fi
+	gdbus call --session --dest org.kde.KWin --object-path /KWin --method org.kde.KWin.reconfigure >/dev/null 2>&1 || true
+	local id
+	for id in "$SCRIPT_ID" krohnkite "${OLD_SCRIPT_IDS[@]}"; do
+		gdbus call --session --dest org.kde.KWin --object-path /Scripting --method org.kde.kwin.Scripting.unloadScript "$id" >/dev/null 2>&1 || true
+	done
+	gdbus call --session --dest org.kde.KWin --object-path /Scripting --method org.kde.kwin.Scripting.start >/dev/null 2>&1 || true
+	sleep 1
+}
+
+qt_key() {
+	local spec="$1" code=0 part key
+	IFS='+' read -ra parts <<<"$spec"
+	if [[ "$spec" == *"++" ]]; then parts+=("+"); fi
+	for part in "${parts[@]}"; do
+		[[ -n "$part" ]] || continue
+		case "$part" in
+			Meta) code=$((code | 0x10000000)) ;;
+			Ctrl) code=$((code | 0x04000000)) ;;
+			Alt) code=$((code | 0x08000000)) ;;
+			Shift) code=$((code | 0x02000000)) ;;
+			*) key="$part" ;;
+		esac
+	done
+	case "$key" in
+		Left) key=0x01000012 ;;
+		Up) key=0x01000013 ;;
+		Right) key=0x01000014 ;;
+		Down) key=0x01000015 ;;
+		Return) key=0x01000004 ;;
+		Enter) key=0x01000005 ;;
+		Tab) key=0x01000001 ;;
+		Esc) key=0x01000000 ;;
+		Backspace) key=0x01000003 ;;
+		Del) key=0x01000007 ;;
+		Home) key=0x01000010 ;;
+		End) key=0x01000011 ;;
+		PgUp) key=0x01000016 ;;
+		PgDown) key=0x01000017 ;;
+		Print) key=0x01000009 ;;
+		Space) key=0x20 ;;
+		Display) key=0x010000d1 ;;
+		F[0-9] | F[0-9][0-9]) key=$((0x01000030 + ${key#F} - 1)) ;;
+		0x*) ;;
+		?) key=$(printf '%d' "'${key^^}") ;;
+		*)
+			warn "unknown key: $spec"
+			return 1
+			;;
+	esac
+	echo $((code | key))
+}
+
+set_keys() {
+	local comp="$1" action="$2" keys="$3" gv="@a(ai) [" first=1 k code
+	if [[ "$keys" != "none" ]]; then
+		IFS=',' read -ra list <<<"$keys"
+		for k in "${list[@]}"; do
+			code="$(qt_key "$k")" || return 1
+			((first)) || gv+=", "
+			gv+="([$code],)"
+			first=0
+		done
+	fi
+	gv+="]"
+	kga /kglobalaccel org.kde.KGlobalAccel.setForeignShortcutKeys "[$(gv_str "$comp"), $(gv_str "$action"), '', '']" "$gv" >/dev/null
+}
+
+current_keys() {
+	kga /kglobalaccel org.kde.KGlobalAccel.shortcutKeys "[$(gv_str "$1"), $(gv_str "$2"), '', '']" | grep -oE '\[[0-9]+' | tr -d '[' | paste -sd, -
+}
+
+apply_shortcuts() {
+	say "Shortcuts"
+	local spec="$DATADIR/shortcuts.conf"
+	[[ -f "$spec" ]] || { warn "missing $spec"; return; }
+	if ! gdbus introspect --session --dest org.kde.kglobalaccel --object-path /kglobalaccel >/dev/null 2>&1; then
+		warn "kglobalaccel is not running; log into Plasma and run again"
+		return
+	fi
+	local comp action keys applied=0 skipped=0 lines=()
+	mapfile -t lines < <(grep -vE '^\s*(#|$)' "$spec")
+	for line in "${lines[@]}"; do
+		IFS='|' read -r comp action keys <<<"$line"
+		set_keys "$comp" "$action" none
+	done
+	for line in "${lines[@]}"; do
+		IFS='|' read -r comp action keys <<<"$line"
+		[[ "$keys" == "none" ]] && continue
+		set_keys "$comp" "$action" "$keys" || continue
+		local want got
+		want="$(IFS=','; for k in $keys; do qt_key "$k"; done | paste -sd, -)"
+		got="$(current_keys "$comp" "$action")"
+		if [[ "$got" == "$want" ]]; then
+			applied=$((applied + 1))
+		else
+			skipped=$((skipped + 1))
+			info "not applied: $comp / $action ($keys) — action missing or key taken"
+		fi
+	done
+	info "$applied shortcuts set, $skipped skipped"
+}
+
+say "snry-kde-setup $VERSION"
+backup
+((do_kwin)) && setup_kwin
+((do_krohnkite)) && install_krohnkite
+((do_rules)) && add_window_rule
+reload_kwin
+((do_shortcuts)) && apply_shortcuts
+say "Done"
+info "Workspaces: Super+1..5 (monitor 1), Super+6..0 (monitor 2), add Shift to move the window"
+info "Monitor names: System Settings > Window Management > KWin Scripts > Snry Workspaces"
+info "HTPC: add the 'HTPC Mode' widget to a panel, or run: snry-htpc --help"

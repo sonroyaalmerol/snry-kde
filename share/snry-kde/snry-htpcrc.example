@@ -1,0 +1,16 @@
+# ~/.config/snry-htpcrc — read by snry-htpc (and written by the HTPC Mode widget).
+# Every key is optional; empty or missing means auto-detect.
+[General]
+TvOutput=HDMI-A-1
+TvMode=1920x1080@60
+TvScale=1
+Monitor1Output=DP-1
+Monitor1Mode=2560x1440@180
+Monitor2Output=DP-2
+Monitor2Mode=1920x1080@144
+Monitor2Position=2560,0
+DesktopSink=alsa_output.usb-Roland_UA-22-00.analog-stereo
+CouchSink=alsa_output.pci-0000_07_00.1.hdmi-stereo
+KodiCommand=kodi
+SteamGamescope=false
+Notifications=true

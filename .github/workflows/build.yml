@@ -1,0 +1,116 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck desktop-file-utils jq
+      - name: Lint
+        run: make check
+
+  dist:
+    needs: check
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Version
+        id: version
+        run: |
+          v="$(scripts/version.sh)"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$v" ]]; then
+            echo "::error::tag ${GITHUB_REF#refs/tags/} does not match VERSION ($v)"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Build source tarball, kwinscript and plasmoid
+        run: make packages VERSION=${{ steps.version.outputs.version }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/*.tar.gz
+            dist/*.kwinscript
+            dist/*.plasmoid
+
+  arch:
+    needs: dist
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Build package
+        env:
+          VERSION: ${{ needs.dist.outputs.version }}
+        run: |
+          useradd -m builder
+          mkdir -p /build
+          cp packaging/arch/PKGBUILD "dist/snry-kde-$VERSION.tar.gz" /build/
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" /build/PKGBUILD
+          chown -R builder /build
+          su builder -c "cd /build && makepkg --nodeps --noconfirm"
+          mkdir -p out && cp /build/*.pkg.tar.zst out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: out/*.pkg.tar.zst
+
+  fedora:
+    needs: dist
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Build RPM
+        env:
+          VERSION: ${{ needs.dist.outputs.version }}
+        run: |
+          dnf -y install rpm-build make
+          top="$PWD/rpmbuild"
+          mkdir -p "$top/SOURCES"
+          cp "dist/snry-kde-$VERSION.tar.gz" "$top/SOURCES/"
+          rpmbuild -bb --define "_topdir $top" --define "pkgversion $VERSION" packaging/fedora/snry-kde.spec
+          mkdir -p out && find "$top/RPMS" -name '*.rpm' -exec cp {} out/ \;
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fedora
+          path: out/*.rpm
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [dist, arch, fedora]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

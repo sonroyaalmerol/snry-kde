@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>SnryWorkspacesConfig</class>
+ <widget class="QWidget" name="SnryWorkspacesConfig">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>400</width>
+    <height>200</height>
+   </rect>
+  </property>
+  <layout class="QFormLayout" name="formLayout">
+   <item row="0" column="0">
+    <widget class="QLabel" name="labelScreen1">
+     <property name="text">
+      <string>Monitor 1 output name:</string>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="1">
+    <widget class="QLineEdit" name="kcfg_screen1Name">
+     <property name="placeholderText">
+      <string>Auto-detect (leftmost)</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="0">
+    <widget class="QLabel" name="labelScreen2">
+     <property name="text">
+      <string>Monitor 2 output name:</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="1">
+    <widget class="QLineEdit" name="kcfg_screen2Name">
+     <property name="placeholderText">
+      <string>Auto-detect (other screen)</string>
+     </property>
+    </widget>
+   </item>
+   <item row="2" column="0" colspan="2">
+    <widget class="QCheckBox" name="kcfg_moveCursor">
+     <property name="text">
+      <string>Automatically move cursor to target monitor when switching workspaces</string>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+</ui>

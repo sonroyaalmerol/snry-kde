@@ -1,0 +1,36 @@
+[Desktop Entry]
+Type=Application
+Name=HTPC Mode
+GenericName=Toggle TV / Desktop
+Comment=Switch between the desktop monitors and the TV
+Icon=video-television
+Exec=@BINDIR@/snry-htpc mode toggle
+Terminal=false
+Categories=Utility;
+Keywords=tv;couch;htpc;kodi;steam;display;monitor;
+Actions=couch;desktop;kodi;steam;stop;
+
+[Desktop Action couch]
+Name=Couch Mode (TV)
+Icon=video-television
+Exec=@BINDIR@/snry-htpc mode couch
+
+[Desktop Action desktop]
+Name=Desktop Mode (Monitors)
+Icon=video-display
+Exec=@BINDIR@/snry-htpc mode desktop
+
+[Desktop Action kodi]
+Name=Kodi on TV
+Icon=kodi
+Exec=@BINDIR@/snry-htpc launch kodi
+
+[Desktop Action steam]
+Name=Steam Big Picture on TV
+Icon=steam
+Exec=@BINDIR@/snry-htpc launch steam
+
+[Desktop Action stop]
+Name=Stop TV Apps
+Icon=media-playback-stop
+Exec=@BINDIR@/snry-htpc stop

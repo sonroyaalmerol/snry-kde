@@ -1,0 +1,20 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Authors": [
+      {
+        "Email": "github@snry.me",
+        "Name": "Son Roy Almerol"
+      }
+    ],
+    "Category": "System Information",
+    "Description": "Switch between desktop monitors and the TV (couch mode), and launch Kodi or Steam Big Picture on the TV",
+    "Icon": "video-television",
+    "Id": "me.snry.htpc",
+    "License": "GPL-3.0-or-later",
+    "Name": "HTPC Mode",
+    "Version": "@VERSION@",
+    "Website": "https://github.com/sonroyaalmerol/snry-kde"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

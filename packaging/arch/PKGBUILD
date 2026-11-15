@@ -1,0 +1,26 @@
+# Maintainer: Son Roy Almerol <github@snry.me>
+pkgname=snry-kde
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Hyprland-style per-monitor workspaces for KWin and an HTPC couch/desktop mode widget for Plasma 6"
+arch=('any')
+url="https://github.com/sonroyaalmerol/snry-kde"
+license=('GPL-3.0-or-later')
+depends=('bash' 'kwin' 'plasma-workspace' 'libkscreen' 'libpulse' 'jq' 'kconfig' 'kpackage' 'kcmutils' 'plasma5support' 'libnotify' 'glib2' 'util-linux' 'procps-ng')
+makedepends=('make')
+optdepends=(
+	'krohnkite: tiling (otherwise snry-kde-setup downloads it)'
+	'curl: download Krohnkite in snry-kde-setup'
+	'kodi: launch Kodi on the TV'
+	'steam: launch Steam Big Picture on the TV'
+	'gamescope: run Big Picture inside gamescope'
+	'kdeconnect: trigger modes from your phone'
+)
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+	cd "$pkgname-$pkgver"
+	make DESTDIR="$pkgdir" PREFIX=/usr VERSION="$pkgver" install
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
